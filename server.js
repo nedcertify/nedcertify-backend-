@@ -30,7 +30,7 @@ function seedData() {
 
   const institutions = [
     {
-      id: uuidv4(),
+      id: "inst-uac",
       name: "Université d'Abomey-Calavi",
       country: "Bénin",
       city: "Abomey-Calavi",
@@ -41,7 +41,7 @@ function seedData() {
       updatedAt: now,
     },
     {
-      id: uuidv4(),
+      id: "inst-ugb",
       name: "Université Gaston Berger de Saint-Louis",
       country: "Sénégal",
       city: "Saint-Louis",
@@ -52,7 +52,7 @@ function seedData() {
       updatedAt: now,
     },
     {
-      id: uuidv4(),
+      id: "inst-estloko",
       name: "E.S.T Loko",
       country: "Côte d'Ivoire",
       city: "Abidjan",
@@ -66,7 +66,7 @@ function seedData() {
 
   const users = [
     {
-      id: uuidv4(),
+      id: "user-admin",
       email: "admin@nedcertify.com",
       password: "admin123",
       name: "Admin NedCertify",
@@ -74,7 +74,7 @@ function seedData() {
       institutionId: null,
     },
     {
-      id: uuidv4(),
+      id: "user-ministry",
       email: "ministry@nedcertify.com",
       password: "ministry123",
       name: "Admin Ministère",
@@ -82,7 +82,7 @@ function seedData() {
       institutionId: null,
     },
     {
-      id: uuidv4(),
+      id: "user-auditor",
       email: "auditor@nedcertify.com",
       password: "auditor123",
       name: "Auditeur NedCertify",
@@ -256,12 +256,8 @@ app.get("/auth/me", authRequired, (req, res) => {
 
 app.get("/dashboard", authRequired, (req, res) => {
   const totalDiplomas = db.diplomas.length;
-  const certifiedDiplomas = db.diplomas.filter(
-    (d) => d.status === "CERTIFIED"
-  ).length;
-  const revokedDiplomas = db.diplomas.filter(
-    (d) => d.status === "REVOKED"
-  ).length;
+  const certifiedDiplomas = db.diplomas.filter((d) => d.status === "CERTIFIED").length;
+  const revokedDiplomas = db.diplomas.filter((d) => d.status === "REVOKED").length;
   const totalInstitutions = db.institutions.length;
 
   const recentActivity = db.audit.slice(0, 10).map((a) => ({
@@ -344,8 +340,7 @@ app.get("/diplomas", authRequired, (req, res) => {
 
 app.post("/diplomas", authRequired, (req, res) => {
   const body = req.body || {};
-  const institution =
-    db.institutions.find((i) => i.id === body.institutionId) || null;
+  const institution = db.institutions.find((i) => i.id === body.institutionId) || null;
 
   const diplomaNumber =
     body.diplomaNumber ||
@@ -368,9 +363,7 @@ app.post("/diplomas", authRequired, (req, res) => {
     blockchainStatus: "PENDING",
     blockchainHash: null,
     certifiedAt: null,
-    verificationUrl: `${PUBLIC_APP_URL}/verify/${encodeURIComponent(
-      diplomaNumber
-    )}`,
+    verificationUrl: `${PUBLIC_APP_URL}/verify/${encodeURIComponent(diplomaNumber)}`,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };
@@ -423,9 +416,7 @@ app.post("/diplomas/:id/certify", authRequired, (req, res) => {
   diploma.status = "CERTIFIED";
   diploma.blockchainStatus = "ANCHORED";
   diploma.blockchainHash =
-    "0x" +
-    uuidv4().replace(/-/g, "") +
-    uuidv4().replace(/-/g, "").slice(0, 8);
+    "0x" + uuidv4().replace(/-/g, "") + uuidv4().replace(/-/g, "").slice(0, 8);
   diploma.certifiedAt = new Date().toISOString();
   diploma.updatedAt = new Date().toISOString();
 
