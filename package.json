@@ -1,7 +1,7 @@
 {
   "name": "nedcertify-simple-backend",
-  "version": "1.0.0",
-  "description": "Simple demo backend for NedCertify",
+  "version": "2.0.0",
+  "description": "NedCertify backend with PostgreSQL persistence",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -12,6 +12,7 @@
     "express": "^4.21.2",
     "jsonwebtoken": "^9.0.2",
     "morgan": "^1.10.0",
+    "pg": "^8.12.0",
     "uuid": "^11.1.0"
   }
 }
