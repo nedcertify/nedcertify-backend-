@@ -24,7 +24,7 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "5mb" }));
 app.use(morgan("dev"));
 app.use(
   cors({
@@ -36,8 +36,84 @@ app.use(
   })
 );
 
+app.use((req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+  next();
+});
+
 async function query(text, params = []) {
   return pool.query(text, params);
+}
+
+function mapUser(row) {
+  return {
+    id: row.id,
+    email: row.email,
+    name: row.name,
+    role: row.role,
+    institutionId: row.institution_id,
+  };
+}
+
+function signToken(user) {
+  return jwt.sign(
+    {
+      sub: user.id,
+      email: user.email,
+      role: user.role,
+      institutionId: user.institution_id || null,
+    },
+    JWT_SECRET,
+    { expiresIn: "12h" }
+  );
+}
+
+async function addAudit({ action, entity, entityId, details, user }) {
+  await query(
+    `INSERT INTO audit_logs (id, action, entity, entity_id, details, user_id, user_name, user_email)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+    [
+      uuidv4(),
+      action,
+      entity,
+      entityId || null,
+      details || null,
+      user?.id || null,
+      user?.name || null,
+      user?.email || null,
+    ]
+  );
+}
+
+async function addVaultActivity({ action, vaultDocumentId, userId, details }) {
+  await query(
+    `INSERT INTO vault_activity (id, action, vault_document_id, user_id, details)
+     VALUES ($1,$2,$3,$4,$5)`,
+    [uuidv4(), action, vaultDocumentId || null, userId || null, details || null]
+  );
+}
+
+async function authRequired(req, res, next) {
+  const header = req.headers.authorization || "";
+  const [scheme, token] = header.split(" ");
+  if (scheme !== "Bearer" || !token) {
+    return res.status(401).json({ message: "Authorization required" });
+  }
+
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    const result = await query(`SELECT * FROM users WHERE id = $1`, [payload.sub]);
+    const user = result.rows[0];
+    if (!user) {
+      return res.status(401).json({ message: "Invalid token user" });
+    }
+    req.user = user;
+    next();
+  } catch (err) {
+    return res.status(401).json({ message: "Invalid or expired token" });
+  }
 }
 
 async function initDb() {
@@ -102,6 +178,66 @@ async function initDb() {
     )
   `);
 
+  await query(`
+    CREATE TABLE IF NOT EXISTS vault_documents (
+      id TEXT PRIMARY KEY,
+      owner_user_id TEXT NULL,
+      owner_name TEXT,
+      title TEXT NOT NULL,
+      document_type TEXT NOT NULL,
+      folder_name TEXT NOT NULL,
+      source_type TEXT NOT NULL,
+      source_diploma_id TEXT NULL,
+      institution_id TEXT NULL,
+      institution_name TEXT NULL,
+      file_url TEXT NULL,
+      mime_type TEXT NULL,
+      status TEXT NOT NULL DEFAULT 'ARCHIVED',
+      vault_status TEXT NOT NULL DEFAULT 'PRIVATE',
+      expires_at TIMESTAMP NULL,
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
+    )
+  `);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS vault_share_links (
+      id TEXT PRIMARY KEY,
+      vault_document_id TEXT NOT NULL,
+      token TEXT UNIQUE NOT NULL,
+      target_label TEXT NULL,
+      access_mode TEXT NOT NULL DEFAULT 'VIEW',
+      expires_at TIMESTAMP NULL,
+      status TEXT NOT NULL DEFAULT 'ACTIVE',
+      created_by_user_id TEXT NULL,
+      created_at TIMESTAMP DEFAULT NOW()
+    )
+  `);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS vault_alarms (
+      id TEXT PRIMARY KEY,
+      vault_document_id TEXT NULL,
+      user_id TEXT NULL,
+      title TEXT NOT NULL,
+      due_date TIMESTAMP NOT NULL,
+      repeat_rule TEXT NULL,
+      status TEXT NOT NULL DEFAULT 'ACTIVE',
+      created_at TIMESTAMP DEFAULT NOW()
+    )
+  `);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS vault_activity (
+      id TEXT PRIMARY KEY,
+      action TEXT NOT NULL,
+      vault_document_id TEXT NULL,
+      user_id TEXT NULL,
+      details TEXT,
+      created_at TIMESTAMP DEFAULT NOW()
+    )
+  `);
+
   await seedData();
 }
 
@@ -112,14 +248,12 @@ async function seedData() {
      ON CONFLICT (email) DO NOTHING`,
     ["user-admin", "admin@nedcertify.com", "admin123", "Admin NedCertify", "SUPER_ADMIN", null]
   );
-
   await query(
     `INSERT INTO users (id, email, password, name, role, institution_id)
      VALUES ($1,$2,$3,$4,$5,$6)
      ON CONFLICT (email) DO NOTHING`,
     ["user-ministry", "ministry@nedcertify.com", "ministry123", "Admin Ministère", "MINISTRY_ADMIN", null]
   );
-
   await query(
     `INSERT INTO users (id, email, password, name, role, institution_id)
      VALUES ($1,$2,$3,$4,$5,$6)
@@ -133,71 +267,72 @@ async function seedData() {
      ON CONFLICT (id) DO NOTHING`,
     ["inst-uac", "Université d'Abomey-Calavi", "Bénin", "Abomey-Calavi", "UNIVERSITY", "ACTIVE", "rectorat@uac.bj"]
   );
-
   await query(
     `INSERT INTO institutions (id, name, country, city, type, status, contact_email)
      VALUES ($1,$2,$3,$4,$5,$6,$7)
      ON CONFLICT (id) DO NOTHING`,
     ["inst-ugb", "Université Gaston Berger de Saint-Louis", "Sénégal", "Saint-Louis", "UNIVERSITY", "ACTIVE", "rectorat@ugb.edu.sn"]
   );
-
-  await query(
-    `INSERT INTO institutions (id, name, country, city, type, status, contact_email)
-     VALUES ($1,$2,$3,$4,$5,$6,$7)
-     ON CONFLICT (id) DO NOTHING`,
-    ["inst-estloko", "E.S.T Loko", "Côte d'Ivoire", "Abidjan", "SCHOOL", "ACTIVE", "contact@estloko.com"]
-  );
 }
 
-async function addAudit({ action, entity, entityId, details, user }) {
+async function archiveDiplomaToVault({ diplomaId, user }) {
+  const diplomaResult = await query(
+    `SELECT d.*, i.name AS institution_name
+     FROM diplomas d
+     LEFT JOIN institutions i ON i.id = d.institution_id
+     WHERE d.id = $1`,
+    [diplomaId]
+  );
+
+  const diploma = diplomaResult.rows[0];
+  if (!diploma) {
+    throw new Error("Diploma not found");
+  }
+
+  const existing = await query(
+    `SELECT id FROM vault_documents WHERE source_diploma_id = $1 LIMIT 1`,
+    [diplomaId]
+  );
+  if (existing.rows[0]) {
+    return existing.rows[0].id;
+  }
+
+  const id = uuidv4();
+  const now = new Date().toISOString();
   await query(
-    `INSERT INTO audit_logs (id, action, entity, entity_id, details, user_id, user_name, user_email)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+    `INSERT INTO vault_documents (
+      id, owner_user_id, owner_name, title, document_type, folder_name,
+      source_type, source_diploma_id, institution_id, institution_name,
+      file_url, mime_type, status, vault_status, created_at, updated_at
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
     [
-      uuidv4(),
-      action,
-      entity,
-      entityId,
-      details,
+      id,
       user?.id || null,
-      user?.name || null,
-      user?.email || null,
+      diploma.student_name,
+      diploma.degree,
+      "CERTIFIED_DIPLOMA",
+      "Diplômes certifiés",
+      "NEDCERTIFY_DIPLOMA",
+      diploma.id,
+      diploma.institution_id,
+      diploma.institution_name,
+      diploma.verification_url,
+      "application/pdf",
+      diploma.status || "CERTIFIED",
+      "ARCHIVED",
+      now,
+      now,
     ]
   );
-}
 
-function signToken(user) {
-  return jwt.sign(
-    {
-      sub: user.id,
-      email: user.email,
-      role: user.role,
-      institutionId: user.institution_id || null,
-    },
-    JWT_SECRET,
-    { expiresIn: "12h" }
-  );
-}
+  await addVaultActivity({
+    action: "DIPLOMA_ARCHIVED",
+    vaultDocumentId: id,
+    userId: user?.id || null,
+    details: `Diplôme archivé automatiquement : ${diploma.diploma_number}`,
+  });
 
-async function authRequired(req, res, next) {
-  const header = req.headers.authorization || "";
-  const [scheme, token] = header.split(" ");
-  if (scheme !== "Bearer" || !token) {
-    return res.status(401).json({ message: "Authorization required" });
-  }
-
-  try {
-    const payload = jwt.verify(token, JWT_SECRET);
-    const result = await query(`SELECT * FROM users WHERE id = $1`, [payload.sub]);
-    const user = result.rows[0];
-    if (!user) {
-      return res.status(401).json({ message: "Invalid token user" });
-    }
-    req.user = user;
-    next();
-  } catch (err) {
-    return res.status(401).json({ message: "Invalid or expired token" });
-  }
+  return id;
 }
 
 app.get("/", (req, res) => {
@@ -216,7 +351,6 @@ app.post("/auth/login", async (req, res) => {
     [email || "", password || ""]
   );
   const user = result.rows[0];
-
   if (!user) {
     return res.status(401).json({ message: "Invalid credentials" });
   }
@@ -230,21 +364,11 @@ app.post("/auth/login", async (req, res) => {
   });
 
   const token = signToken(user);
-  return res.json({
-    token,
-    user: {
-      id: user.id,
-      email: user.email,
-      name: user.name,
-      role: user.role,
-      institutionId: user.institution_id,
-    },
-  });
+  res.json({ token, user: mapUser(user) });
 });
 
 app.post("/auth/signup", async (req, res) => {
   const { email, password, name } = req.body || {};
-
   if (!email || !password || !name) {
     return res.status(400).json({ message: "Nom, email et mot de passe requis" });
   }
@@ -261,8 +385,7 @@ app.post("/auth/signup", async (req, res) => {
     [id, email, password, name, "INSTITUTION_ADMIN", null]
   );
 
-  const user = { id, email, password, name, role: "INSTITUTION_ADMIN", institution_id: null };
-
+  const user = { id, email, name, role: "INSTITUTION_ADMIN", institution_id: null };
   await addAudit({
     action: "SIGNUP",
     entity: "User",
@@ -271,22 +394,11 @@ app.post("/auth/signup", async (req, res) => {
     user,
   });
 
-  const token = signToken(user);
-  res.status(201).json({
-    token,
-    user: { id, email, name, role: "INSTITUTION_ADMIN", institutionId: null },
-  });
+  res.status(201).json({ token: signToken(user), user: mapUser(user) });
 });
 
-app.get("/auth/me", authRequired, (req, res) => {
-  const u = req.user;
-  res.json({
-    id: u.id,
-    email: u.email,
-    name: u.name,
-    role: u.role,
-    institutionId: u.institution_id,
-  });
+app.get("/auth/me", authRequired, async (req, res) => {
+  res.json(mapUser(req.user));
 });
 
 app.get("/dashboard", authRequired, async (req, res) => {
@@ -294,13 +406,10 @@ app.get("/dashboard", authRequired, async (req, res) => {
   const certifiedDiplomas = Number((await query(`SELECT COUNT(*)::int AS count FROM diplomas WHERE status='CERTIFIED'`)).rows[0].count);
   const revokedDiplomas = Number((await query(`SELECT COUNT(*)::int AS count FROM diplomas WHERE status='REVOKED'`)).rows[0].count);
   const totalInstitutions = Number((await query(`SELECT COUNT(*)::int AS count FROM institutions`)).rows[0].count);
-
   const recentActivity = (
     await query(
       `SELECT id, action, entity, details, created_at, user_name, user_email
-       FROM audit_logs
-       ORDER BY created_at DESC
-       LIMIT 10`
+       FROM audit_logs ORDER BY created_at DESC LIMIT 10`
     )
   ).rows.map((a) => ({
     id: a.id,
@@ -311,13 +420,7 @@ app.get("/dashboard", authRequired, async (req, res) => {
     user: a.user_name ? { name: a.user_name, email: a.user_email } : null,
   }));
 
-  res.json({
-    totalDiplomas,
-    certifiedDiplomas,
-    revokedDiplomas,
-    totalInstitutions,
-    recentActivity,
-  });
+  res.json({ totalDiplomas, certifiedDiplomas, revokedDiplomas, totalInstitutions, recentActivity });
 });
 
 app.get("/institutions", authRequired, async (req, res) => {
@@ -340,7 +443,6 @@ app.get("/institutions", authRequired, async (req, res) => {
 app.post("/institutions", authRequired, async (req, res) => {
   const id = uuidv4();
   const now = new Date().toISOString();
-
   await query(
     `INSERT INTO institutions (id, name, country, city, type, status, contact_email, created_at, updated_at)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
@@ -380,9 +482,7 @@ app.post("/institutions", authRequired, async (req, res) => {
 
 app.patch("/institutions/:id", authRequired, async (req, res) => {
   const check = await query(`SELECT * FROM institutions WHERE id = $1`, [req.params.id]);
-  if (!check.rows[0]) {
-    return res.status(404).json({ message: "Institution not found" });
-  }
+  if (!check.rows[0]) return res.status(404).json({ message: "Institution not found" });
 
   const current = check.rows[0];
   const updated = {
@@ -399,16 +499,7 @@ app.patch("/institutions/:id", authRequired, async (req, res) => {
     `UPDATE institutions
      SET name=$1, country=$2, city=$3, type=$4, status=$5, contact_email=$6, updated_at=$7
      WHERE id=$8`,
-    [
-      updated.name,
-      updated.country,
-      updated.city,
-      updated.type,
-      updated.status,
-      updated.contact_email,
-      updated.updated_at,
-      req.params.id,
-    ]
+    [updated.name, updated.country, updated.city, updated.type, updated.status, updated.contact_email, updated.updated_at, req.params.id]
   );
 
   await addAudit({
@@ -458,9 +549,7 @@ app.get("/diplomas", authRequired, async (req, res) => {
       verificationUrl: d.verification_url,
       createdAt: d.created_at,
       updatedAt: d.updated_at,
-      institution: d.institution_id
-        ? { id: d.institution_id, name: d.institution_name }
-        : null,
+      institution: d.institution_id ? { id: d.institution_id, name: d.institution_name } : null,
     }))
   );
 });
@@ -469,11 +558,7 @@ app.post("/diplomas", authRequired, async (req, res) => {
   const id = uuidv4();
   const body = req.body || {};
   const now = new Date().toISOString();
-
-  const diplomaNumber =
-    body.diplomaNumber ||
-    `NC-${new Date().getFullYear()}-${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
-
+  const diplomaNumber = body.diplomaNumber || `NC-${new Date().getFullYear()}-${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
   const verificationUrl = `${PUBLIC_APP_URL}/verify/${encodeURIComponent(diplomaNumber)}`;
 
   await query(
@@ -481,8 +566,7 @@ app.post("/diplomas", authRequired, async (req, res) => {
       id, diploma_number, student_name, student_id, date_of_birth, degree, field,
       graduation_date, institution_id, status, blockchain_status, blockchain_hash,
       certified_at, verification_url, created_at, updated_at
-    )
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
     [
       id,
       diplomaNumber,
@@ -533,9 +617,7 @@ app.post("/diplomas", authRequired, async (req, res) => {
 
 app.patch("/diplomas/:id", authRequired, async (req, res) => {
   const check = await query(`SELECT * FROM diplomas WHERE id = $1`, [req.params.id]);
-  if (!check.rows[0]) {
-    return res.status(404).json({ message: "Diploma not found" });
-  }
+  if (!check.rows[0]) return res.status(404).json({ message: "Diploma not found" });
 
   const current = check.rows[0];
   const updated = {
@@ -575,35 +657,15 @@ app.patch("/diplomas/:id", authRequired, async (req, res) => {
     user: req.user,
   });
 
-  res.json({
-    id: req.params.id,
-    diplomaNumber: current.diploma_number,
-    studentName: updated.student_name,
-    studentId: updated.student_id,
-    dateOfBirth: updated.date_of_birth,
-    degree: updated.degree,
-    field: updated.field,
-    graduationDate: updated.graduation_date,
-    institutionId: updated.institution_id,
-    status: current.status,
-    blockchainStatus: current.blockchain_status,
-    blockchainHash: current.blockchain_hash,
-    certifiedAt: current.certified_at,
-    verificationUrl: current.verification_url,
-    createdAt: current.created_at,
-    updatedAt: updated.updated_at,
-  });
+  res.json({ id: req.params.id, updatedAt: updated.updated_at });
 });
 
 app.post("/diplomas/:id/certify", authRequired, async (req, res) => {
   const check = await query(`SELECT * FROM diplomas WHERE id = $1`, [req.params.id]);
-  if (!check.rows[0]) {
-    return res.status(404).json({ message: "Diploma not found" });
-  }
+  if (!check.rows[0]) return res.status(404).json({ message: "Diploma not found" });
 
   const current = check.rows[0];
-  const blockchainHash =
-    "0x" + uuidv4().replace(/-/g, "") + uuidv4().replace(/-/g, "").slice(0, 8);
+  const blockchainHash = "0x" + uuidv4().replace(/-/g, "") + uuidv4().replace(/-/g, "").slice(0, 8);
   const certifiedAt = new Date().toISOString();
   const updatedAt = certifiedAt;
 
@@ -623,38 +685,27 @@ app.post("/diplomas/:id/certify", authRequired, async (req, res) => {
     user: req.user,
   });
 
+  const vaultDocumentId = await archiveDiplomaToVault({ diplomaId: req.params.id, user: req.user });
+
   res.json({
     id: current.id,
     diplomaNumber: current.diploma_number,
-    studentName: current.student_name,
-    studentId: current.student_id,
-    degree: current.degree,
-    field: current.field,
-    graduationDate: current.graduation_date,
-    institutionId: current.institution_id,
     status: "CERTIFIED",
     blockchainStatus: "ANCHORED",
     blockchainHash,
     certifiedAt,
-    verificationUrl: current.verification_url,
-    createdAt: current.created_at,
     updatedAt,
+    vaultDocumentId,
   });
 });
 
 app.post("/diplomas/:id/revoke", authRequired, async (req, res) => {
   const check = await query(`SELECT * FROM diplomas WHERE id = $1`, [req.params.id]);
-  if (!check.rows[0]) {
-    return res.status(404).json({ message: "Diploma not found" });
-  }
+  if (!check.rows[0]) return res.status(404).json({ message: "Diploma not found" });
 
   const current = check.rows[0];
   const updatedAt = new Date().toISOString();
-
-  await query(
-    `UPDATE diplomas SET status='REVOKED', updated_at=$1 WHERE id=$2`,
-    [updatedAt, req.params.id]
-  );
+  await query(`UPDATE diplomas SET status='REVOKED', updated_at=$1 WHERE id=$2`, [updatedAt, req.params.id]);
 
   await addAudit({
     action: "REVOCATION",
@@ -664,23 +715,7 @@ app.post("/diplomas/:id/revoke", authRequired, async (req, res) => {
     user: req.user,
   });
 
-  res.json({
-    id: current.id,
-    diplomaNumber: current.diploma_number,
-    studentName: current.student_name,
-    studentId: current.student_id,
-    degree: current.degree,
-    field: current.field,
-    graduationDate: current.graduation_date,
-    institutionId: current.institution_id,
-    status: "REVOKED",
-    blockchainStatus: current.blockchain_status,
-    blockchainHash: current.blockchain_hash,
-    certifiedAt: current.certified_at,
-    verificationUrl: current.verification_url,
-    createdAt: current.created_at,
-    updatedAt,
-  });
+  res.json({ id: current.id, diplomaNumber: current.diploma_number, status: "REVOKED", updatedAt });
 });
 
 app.get("/audit", authRequired, async (req, res) => {
@@ -705,7 +740,6 @@ app.get("/audit", authRequired, async (req, res) => {
   const whereClause = where.length ? `WHERE ${where.join(" AND ")}` : "";
   const countResult = await query(`SELECT COUNT(*)::int AS count FROM audit_logs ${whereClause}`, params);
   const total = countResult.rows[0].count;
-
   const pageNum = Number(page) || 1;
   const limitNum = Number(limit) || 30;
   const offset = (pageNum - 1) * limitNum;
@@ -736,7 +770,6 @@ app.get("/audit", authRequired, async (req, res) => {
 
 app.get("/verify/:id", async (req, res) => {
   const id = decodeURIComponent(req.params.id);
-
   const result = await query(
     `SELECT d.*, i.name AS institution_name, i.country AS institution_country, i.city AS institution_city, i.type AS institution_type
      FROM diplomas d
@@ -747,7 +780,6 @@ app.get("/verify/:id", async (req, res) => {
   );
 
   const diploma = result.rows[0];
-
   if (!diploma) {
     return res.status(404).json({
       valid: false,
@@ -803,7 +835,7 @@ app.get("/verify/:id", async (req, res) => {
     });
   }
 
-  return res.json({
+  res.json({
     valid: true,
     diploma: {
       diplomaNumber: diploma.diploma_number,
@@ -821,6 +853,216 @@ app.get("/verify/:id", async (req, res) => {
     verifiedAt: new Date().toISOString(),
     message: "Ce diplôme est authentique et certifié.",
   });
+});
+
+// Vault routes
+app.get("/vault/summary", authRequired, async (req, res) => {
+  const totalDocuments = Number((await query(`SELECT COUNT(*)::int AS count FROM vault_documents`)).rows[0].count);
+  const activeShares = Number((await query(`SELECT COUNT(*)::int AS count FROM vault_share_links WHERE status='ACTIVE'`)).rows[0].count);
+  const expiringLinks = Number((await query(`SELECT COUNT(*)::int AS count FROM vault_share_links WHERE status='ACTIVE' AND expires_at IS NOT NULL`)).rows[0].count);
+  const alarms = Number((await query(`SELECT COUNT(*)::int AS count FROM vault_alarms WHERE status='ACTIVE'`)).rows[0].count);
+  const storage = `${Math.max(1, totalDocuments * 0.2).toFixed(1)} GB`;
+  res.json({ totalDocuments, activeShares, expiringLinks, alarms, storage });
+});
+
+app.get("/vault/documents", authRequired, async (req, res) => {
+  const result = await query(`SELECT * FROM vault_documents ORDER BY created_at DESC`);
+  res.json(
+    result.rows.map((row) => ({
+      id: row.id,
+      ownerUserId: row.owner_user_id,
+      ownerName: row.owner_name,
+      title: row.title,
+      documentType: row.document_type,
+      folderName: row.folder_name,
+      sourceType: row.source_type,
+      sourceDiplomaId: row.source_diploma_id,
+      institutionId: row.institution_id,
+      institutionName: row.institution_name,
+      fileUrl: row.file_url,
+      mimeType: row.mime_type,
+      status: row.status,
+      vaultStatus: row.vault_status,
+      expiresAt: row.expires_at,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    }))
+  );
+});
+
+app.post("/vault/documents", authRequired, async (req, res) => {
+  const id = uuidv4();
+  const now = new Date().toISOString();
+  const body = req.body || {};
+
+  await query(
+    `INSERT INTO vault_documents (
+      id, owner_user_id, owner_name, title, document_type, folder_name,
+      source_type, source_diploma_id, institution_id, institution_name,
+      file_url, mime_type, status, vault_status, expires_at, created_at, updated_at
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
+    [
+      id,
+      body.ownerUserId || req.user.id,
+      body.ownerName || req.user.name,
+      body.title,
+      body.documentType || "GENERIC",
+      body.folderName || "Documents professionnels",
+      body.sourceType || "MANUAL_UPLOAD",
+      body.sourceDiplomaId || null,
+      body.institutionId || null,
+      body.institutionName || null,
+      body.fileUrl || null,
+      body.mimeType || null,
+      body.status || "ARCHIVED",
+      body.vaultStatus || "PRIVATE",
+      body.expiresAt || null,
+      now,
+      now,
+    ]
+  );
+
+  await addVaultActivity({
+    action: "DOCUMENT_CREATED",
+    vaultDocumentId: id,
+    userId: req.user.id,
+    details: `Document ajouté au coffre : ${body.title}`,
+  });
+
+  res.status(201).json({ id, message: "Document archivé dans le coffre-fort" });
+});
+
+app.post("/vault/archive-from-diploma/:id", authRequired, async (req, res) => {
+  try {
+    const id = await archiveDiplomaToVault({ diplomaId: req.params.id, user: req.user });
+    res.status(201).json({ id, message: "Diplôme archivé automatiquement dans le coffre-fort" });
+  } catch (err) {
+    res.status(404).json({ message: err.message || "Diploma not found" });
+  }
+});
+
+app.get("/vault/share-links", authRequired, async (req, res) => {
+  const result = await query(
+    `SELECT s.*, d.title AS document_title
+     FROM vault_share_links s
+     JOIN vault_documents d ON d.id = s.vault_document_id
+     ORDER BY s.created_at DESC`
+  );
+  res.json(
+    result.rows.map((row) => ({
+      id: row.id,
+      vaultDocumentId: row.vault_document_id,
+      token: row.token,
+      targetLabel: row.target_label,
+      accessMode: row.access_mode,
+      expiresAt: row.expires_at,
+      status: row.status,
+      createdByUserId: row.created_by_user_id,
+      createdAt: row.created_at,
+      documentTitle: row.document_title,
+      shareUrl: `${PUBLIC_APP_URL}/vault/share/${row.token}`,
+    }))
+  );
+});
+
+app.post("/vault/share-links", authRequired, async (req, res) => {
+  const body = req.body || {};
+  const id = uuidv4();
+  const token = uuidv4().replace(/-/g, "") + uuidv4().replace(/-/g, "");
+  await query(
+    `INSERT INTO vault_share_links (
+      id, vault_document_id, token, target_label, access_mode,
+      expires_at, status, created_by_user_id
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+    [
+      id,
+      body.vaultDocumentId,
+      token,
+      body.targetLabel || null,
+      body.accessMode || "VIEW",
+      body.expiresAt || null,
+      "ACTIVE",
+      req.user.id,
+    ]
+  );
+
+  await addVaultActivity({
+    action: "SHARE_LINK_CREATED",
+    vaultDocumentId: body.vaultDocumentId,
+    userId: req.user.id,
+    details: `Lien sécurisé créé pour ${body.targetLabel || "un destinataire"}`,
+  });
+
+  res.status(201).json({ id, token, shareUrl: `${PUBLIC_APP_URL}/vault/share/${token}` });
+});
+
+app.get("/vault/share/:token", async (req, res) => {
+  const result = await query(
+    `SELECT s.*, d.title, d.owner_name, d.institution_name, d.status AS document_status, d.vault_status
+     FROM vault_share_links s
+     JOIN vault_documents d ON d.id = s.vault_document_id
+     WHERE s.token = $1
+     LIMIT 1`,
+    [req.params.token]
+  );
+
+  const share = result.rows[0];
+  if (!share) return res.status(404).json({ message: "Lien introuvable" });
+  if (share.status !== "ACTIVE") return res.status(403).json({ message: "Lien inactif" });
+  if (share.expires_at && new Date(share.expires_at) < new Date()) {
+    return res.status(403).json({ message: "Lien expiré" });
+  }
+
+  res.json({
+    title: share.title,
+    ownerName: share.owner_name,
+    institutionName: share.institution_name,
+    status: share.document_status,
+    vaultStatus: share.vault_status,
+    targetLabel: share.target_label,
+    accessMode: share.access_mode,
+  });
+});
+
+app.get("/vault/alarms", authRequired, async (req, res) => {
+  const result = await query(`SELECT * FROM vault_alarms ORDER BY due_date ASC`);
+  res.json(
+    result.rows.map((row) => ({
+      id: row.id,
+      vaultDocumentId: row.vault_document_id,
+      userId: row.user_id,
+      title: row.title,
+      dueDate: row.due_date,
+      repeatRule: row.repeat_rule,
+      status: row.status,
+      createdAt: row.created_at,
+    }))
+  );
+});
+
+app.post("/vault/alarms", authRequired, async (req, res) => {
+  const body = req.body || {};
+  const id = uuidv4();
+  await query(
+    `INSERT INTO vault_alarms (id, vault_document_id, user_id, title, due_date, repeat_rule, status)
+     VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+    [id, body.vaultDocumentId || null, req.user.id, body.title, body.dueDate, body.repeatRule || null, "ACTIVE"]
+  );
+  res.status(201).json({ id, message: "Alarme créée" });
+});
+
+app.get("/vault/activity", authRequired, async (req, res) => {
+  const result = await query(`SELECT * FROM vault_activity ORDER BY created_at DESC LIMIT 50`);
+  res.json(
+    result.rows.map((row) => ({
+      id: row.id,
+      action: row.action,
+      vaultDocumentId: row.vault_document_id,
+      userId: row.user_id,
+      details: row.details,
+      createdAt: row.created_at,
+    }))
+  );
 });
 
 initDb()
